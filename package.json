@@ -1,0 +1,37 @@
+{
+  "name": "mantis2gitlab",
+  "version": "1.0.0",
+  "description": "Import Mantis issues into GitLab.",
+  "dependencies": {
+    "async": "~0.2.9",
+    "colors": "~0.6.2",
+    "csv": "~0.3.6",
+    "lodash": "^3.10.1",
+    "optimist": "~0.6.0",
+    "restler": "~3.1.0"
+  },
+  "devDependencies": {},
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "preferGlobal": true,
+  "main": "m2gl.js",
+  "bin": {
+    "m2gl": "./m2gl.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nonplus/mantis2gitlab"
+  },
+  "bugs": {
+    "url": "https://github.com/nonplus/mantis2gitlab/issues"
+  },
+  "keywords": [
+    "gitlab",
+    "mantis",
+    "issue"
+  ],
+  "author": "Stepan Riha",
+  "license": "MIT",
+  "readmeFilename": "README.md"
+}
