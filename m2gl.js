@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 
-var fs = require('fs');
+var Q = require('q');
+var FS = require('q-io/fs');
 var util = require('util');
 var colors = require('colors');
 var csv = require('csv');
-var rest = require('restler');
+var rest = require('restler-q');
 var async = require('async');
 var _ = require('lodash');
 var argv = require('optimist')
@@ -15,215 +16,326 @@ var argv = require('optimist')
     .alias('p', 'project')
     .alias('t', 'token')
     .alias('s', 'sudo')
+    .alias('f', 'from')
     .describe('i', 'CSV file exported from Mantis (Example: issues.csv)')
     .describe('c', 'Configuration file (Example: config.json)')
     .describe('g', 'GitLab URL hostname (Example: https://gitlab.com)')
     .describe('p', 'GitLab project name including namespace (Example: mycorp/myproj)')
     .describe('t', 'An admin user\'s private token (Example: a2r33oczFyQzq53t23Vj)')
     .describe('s', 'The username performing the import (Example: bob)')
+    .describe('f', 'The first issue # to import (Example: 123)')
     .argv;
 
 var inputFile = __dirname + '/' + argv.input;
 var configFile = __dirname + '/' + argv.config;
+var fromIssueId = Number(argv.from||0);
 var gitlabAPIURLBase = argv.gitlaburl + '/api/v3';
 var gitlabProjectName = argv.project;
 var gitlabAdminPrivateToken = argv.token;
 var gitlabSudo = argv.sudo;
 var config = {};
 
-getGitLabProject(gitlabProjectName, gitlabAdminPrivateToken, function(error, project) {
-  if (error) {
-    console.error('Error: Cannot get list of projects from gitlab: ' + gitlabAPIURLBase);
-    return;
-  }
+var gitLab = {};
+var promise = getConfig()
+        .then(readMantisIssues)
+        .then(getGitLabProject)
+        .then(getGitLabProjectMembers)
+        .then(mapGitLabUserIds)
+        .then(validateMantisIssues)
+        .then(getGitLabProjectIssues)
+        .then(importGitLabIssues)
+    ;
 
-  if (!project) {
-    console.error('Error: Cannot find GitLab project: ' + gitlabProjectName);
-    return;
-  }
+promise.then(function() {
+  console.log(("Done!").bold.green);
+}, function(err) {
+  console.error(err);
+});
 
-  getGitLabUsers(gitlabAdminPrivateToken, function(error, gitlabUsers) {
-    if (error) {
-      console.error('Error: Cannot get list of users from gitlab: ' + gitlabAPIURLBase);
-      return;
-    }
-
-    getConfig(configFile, function(error, cfg) {
-      if (error) {
-        console.error('Error: Cannot read config file: ' + configFile);
-        return;
-      }
-
-      config = cfg;
-
-      var users = config.users;
-
-      setGitLabUserIds(users, gitlabUsers);
-
-      readRows(inputFile, function(error, rows) {
-        if (error) {
-          console.error('Error: Cannot read input file: ' + inputFile);
-          return;
-        }
-
-        validate(rows, users, function(missingUsernames, missingNames) {
-          if (missingUsernames.length > 0 || missingNames.length > 0) {
-            for (var i = 0; i < missingUsernames.length; i++)
-              console.error('Error: Cannot map Mantis user with username: ' + missingUsernames[i]);
-
-            for (var i = 0; i < missingNames.length; i++)
-              console.error('Error: Cannot map Mantis user with name: ' + missingNames[i]);
-
-            return;
+/**
+ * Read and parse config.json file - assigns config
+ */
+function getConfig() {
+  log_progress("Reading configuration...");
+  return FS.read(configFile, {encoding: 'utf8'})
+      .then(function(data) {
+        var config = JSON.parse(data);
+        config.users = _.extend({
+          "": {
+            name: "Unknown",
+            gl_username: gitlabSudo
           }
-
-          rows = _.sortBy(rows, function(row) { return Date.parse(row.Created); });
-
-          async.eachSeries(rows, function(row, callback) {
-            var issueId = row.Id;
-            var title = row.Summary;
-            var description = getDescription(row);
-            var assignee = getUserByMantisUsername(users, row["Assigned To"]);
-            var milestoneId = '';
-            var labels = getLabels(row);
-            var author = getUserByMantisUsername(users, row.Reporter);
-
-            insertIssue(project.id, title, description, assignee && assignee.gl_id, milestoneId, labels, author.gl_username, gitlabAdminPrivateToken, function(error, issue) {
-              setTimeout(callback, 1000);
-
-              if (error) {
-                console.error((issueId + ': Failed to insert.').red, error);
-                return;
-              }
-
-              if (isClosed(row)) {
-                closeIssue(issue, assignee.gl_private_token || gitlabAdminPrivateToken, function(error) {
-                  if (error)
-                    console.warn((issueId + ': Inserted successfully but failed to close. #' + issue.iid).yellow);
-                  else
-                    console.error((issueId + ': Inserted and closed successfully. #' + issue.iid).green);
-                });
-
-                return;
-              }
-
-              console.log((issueId + ': Inserted successfully. #' + issue.iid).green);
-            });
-          });
-        });
+        }, config.users);
+        return config;
+      }).then(function(cfg) {
+        config = cfg;
+      }, function() {
+        throw new Error('Cannot read config file: ' + configFile);
       });
-    });
-  });
-})
-
-function getGitLabProject(name, privateToken, callback) {
-  var url = gitlabAPIURLBase + '/projects';
-  var data = { per_page: 100, private_token: privateToken, sudo: gitlabSudo };
-
-  rest.get(url, {data: data}).on('complete', function(result, response) {
-    if (util.isError(result)) {
-      callback(result);
-      return;
-    }
-
-    if (response.statusCode != 200) {
-      callback(result);
-      return;
-    }
-
-    for (var i = 0; i < result.length; i++) {
-      if (result[i].path_with_namespace === name) {
-        callback(null, result[i]);
-        return;
-      }
-    };
-
-    callback(null, null);
-  });
 }
 
-function getGitLabUsers(privateToken, callback) {
-  var url = gitlabAPIURLBase + '/users';
-  var data = { per_page: 100, private_token: privateToken, sudo: gitlabSudo };
-
-  rest.get(url, {data: data}).on('complete', function(result, response) {
-    if (util.isError(result)) {
-      callback(result);
-      return;
-    }
-
-    if (response.statusCode != 200) {
-      callback(result);
-      return;
-    }
-
-    callback(null, result);
-  });
-}
-
-function getConfig(configFile, callback) {
-  fs.readFile(configFile, {encoding: 'utf8'}, function(error, data) {
-    if (error) {
-      callback(error);
-      return;
-    }
-
-    var config = JSON.parse(data);
-    config.users = config.users || [];
-
-    callback(null, config);
-  });
-}
-
-function setGitLabUserIds(users, gitlabUsers) {
-  for (var i = 0; i < users.length; i++) {
-    for (var j = 0; j < gitlabUsers.length; j++) {
-      if (users[i].gl_username === gitlabUsers[j].username) {
-        users[i].gl_id = gitlabUsers[j].id;
-        break;
-      }
-    }
-  }
-}
-
-function readRows(inputFile, callback) {
-  fs.readFile(inputFile, {encoding: 'utf8'}, function(error, data) {
-    if (error) {
-      callback(error);
-      return;
-    }
-
+/**
+ * Read and parse import.csv file - assigns gitLab.mantisIssues
+ */
+function readMantisIssues() {
+  log_progress("Reading Mantis export file...");
+  return FS.read(inputFile, {encoding: 'utf8'}).then(function(data) {
     var rows = [];
+    var dfd = Q.defer();
 
     csv().from(data, {delimiter: ',', escape: '"', columns: true})
-    .on('record', function(row, index) { rows.push(row) })
-    .on('end', function() { callback(null, rows) });
+        .on('record', function(row, index) { rows.push(row) })
+        .on('end', function(error, data) {
+          dfd.resolve(rows);
+        });
+
+    return dfd.promise
+        .then(function(rows) {
+          _.forEach(rows, function(row) {
+            row.Id = Number(row.Id);
+          });
+
+          if(fromIssueId) {
+            rows = _.filter(rows, function(row) {
+              return row.Id >= fromIssueId;
+            })
+          }
+
+          return gitLab.mantisIssues = _.sortBy(rows, "Id");
+        }, function(error) {
+          throw new Error('Cannot read input file: ' + inputFile + " - " + error);
+        });
   });
 }
 
-function validate(rows, users, callback) {
-  var missingUsername = [];
-  var missingNames = [];
+/**
+ * Fetch project info from GitLab - assigns gitLab.project
+ */
+function getGitLabProject() {
+  log_progress("Fetching project from GitLab...");
+  var url = gitlabAPIURLBase + '/projects';
+  var data = { per_page: 100, private_token: gitlabAdminPrivateToken, sudo: gitlabSudo };
 
-  for (var i = 0; i < rows.length; i++) {
-    var assignee = rows[i]["Assigned To"];
+  return rest.get(url, {data: data}).then(function(result) {
 
-    if (!getUserByMantisUsername(users, assignee) && missingUsername.indexOf(assignee) == -1)
-      missingUsername.push(assignee);
-  }
+    gitLab.project = _.find(result, { path_with_namespace : gitlabProjectName }) || null;
 
-  for (var i = 0; i < rows.length; i++) {
-    var reporter = rows[i].Reporter;
+    if (!gitLab.project) {
+      throw new Error('Cannot find GitLab project: ' + gitlabProjectName);
+    }
 
-    if (!getUserByMantisUsername(users, reporter) && missingNames.indexOf(reporter) == -1)
-      missingNames.push(reporter);
-  }
-
-  callback(missingUsername, missingNames);
+    return gitLab.project;
+  }, function(error) {
+    throw new Error('Cannot get list of projects from gitlab: ' + url);
+  });
 }
 
-function getUserByMantisUsername(users, username) {
-  return (username && _.find(users, {username: username || null })) || null;
+/**
+ * Fetch project members from GitLab - assigns gitLab.gitlabUsers
+ */
+function getGitLabProjectMembers() {
+  log_progress("getGitLabProjectMembers");
+  var url = gitlabAPIURLBase + '/projects/' + gitLab.project.id + "/members";
+  var data = { per_page: 100, private_token: gitlabAdminPrivateToken, sudo: gitlabSudo };
+
+  return rest.get(url, {data: data}).then(function(result) {
+    return gitLab.gitlabUsers = result;
+  }, function(error) {
+    throw new Error('Cannot get list of users from gitlab: ' + url);
+  });
+}
+
+/**
+ * Sets config.users[].gl_id based gitLab.gitlabUsers
+ */
+function mapGitLabUserIds() {
+  var users = config.users,
+      gitlabUsers = gitLab.gitlabUsers;
+  _.forEach(users, function(user) {
+    user.gl_id = (_.find(gitlabUsers, { id: user.gl_username }) || {}).id;
+  });
+}
+
+/**
+ * Ensure that Mantise user names in gitLab.mantisIssues have corresponding GitLab user mapping
+ */
+function validateMantisIssues() {
+  log_progress("Validating Mantis Users...");
+
+  var mantisIssues = gitLab.mantisIssues;
+  var users = config.users;
+
+  var missingUsernames = [];
+
+  for (var i = 0; i < mantisIssues.length; i++) {
+    var assignee = mantisIssues[i]["Assigned To"];
+
+    if (!getUserByMantisUsername(assignee) && missingUsernames.indexOf(assignee) == -1)
+      missingUsernames.push(assignee);
+  }
+
+  for (var i = 0; i < mantisIssues.length; i++) {
+    var reporter = mantisIssues[i].Reporter;
+
+    if (!getUserByMantisUsername(reporter) && missingUsernames.indexOf(reporter) == -1)
+      missingUsernames.push(reporter);
+  }
+
+  if (missingUsernames.length > 0) {
+    for (var i = 0; i < missingUsernames.length; i++)
+      console.error('Error: Cannot map Mantis user with username: ' + missingUsernames[i]);
+
+    throw new Error("User Validation Failed");
+  }
+}
+
+/**
+ * Import gitLab.mantisIssues into GitLab
+ * @returns {*}
+ */
+function importGitLabIssues() {
+  log_progress("Importing Mantis issues into GitLab from #" + fromIssueId + " ...");
+  return _.reduce(gitLab.mantisIssues, function(p, mantisIssue) {
+    return p.then(function() {
+      return importIssue(mantisIssue);
+    });
+  }, Q());
+
+}
+
+function importIssue(mantisIssue) {
+  var issueId = mantisIssue.Id;
+  var title = mantisIssue.Summary;
+  var description = getDescription(mantisIssue);
+  var assignee = getUserByMantisUsername(mantisIssue["Assigned To"]);
+  var milestoneId = '';
+  var labels = getLabels(mantisIssue);
+  var author = getUserByMantisUsername(mantisIssue.Reporter);
+
+  log_progress("Importing: #" + issueId + " - " + title + " ...");
+
+  var data = {
+    title: title,
+    description: description,
+    assignee_id: assignee && assignee.gl_id,
+    milestone_id: milestoneId,
+    labels: labels,
+    sudo: gitlabSudo,
+    private_token: gitlabAdminPrivateToken
+  };
+
+  return getIssue(gitLab.project.id, issueId)
+      .then(function(gitLabIssue) {
+        if (gitLabIssue) {
+          return updateIssue(gitLab.project.id, gitLabIssue.id, _.extend({
+            state_event: isClosed(mantisIssue) ? 'close' : 'reopen'
+          }, data))
+              .then(function() {
+                console.log(("#" + issueId + ": Updated successfully.").green);
+              });
+        } else {
+          return insertSkippedIssues(issueId-1)
+              .then(function() {
+                return insertAndCloseIssue(issueId, data, isClosed(mantisIssue));
+              });
+        }
+      });
+}
+
+function insertSkippedIssues(issueId) {
+  if (gitLab.gitlabIssues[issueId]) {
+    return Q();
+  }
+
+  console.warn(("Skipping Missing Mantis Issue (<= #" + issueId + ") ...").yellow);
+
+  var data = {
+    title: "Skipped Mantis Issue",
+    sudo: gitlabSudo,
+    private_token: gitlabAdminPrivateToken
+  };
+
+  return insertAndCloseIssue(issueId, data, true, getSkippedIssueData)
+      .then(function() {
+        return insertSkippedIssues(issueId);
+      });
+
+  function getSkippedIssueData(gitLabIssue) {
+    var issueId = gitLabIssue.iid;
+    var description;
+    if (config.mantisUrl) {
+      description = "[Mantis Issue " + issueId + "](" + config.mantisUrl + "/view.php?id=" + issueId + ")";
+    } else {
+      description = "Mantis Issue " + issueId;
+    }
+    return {
+      title: "Skipped Mantis Issue " + issueId,
+      description: "_Skipped " + description + "_"
+    };
+  }
+}
+
+function insertAndCloseIssue(issueId, data, close, custom) {
+
+  return insertIssue(gitLab.project.id, data).then(function(issue) {
+    gitLab.gitlabIssues[issue.iid] = issue;
+    if (close) {
+      return closeIssue(issue, custom && custom(issue)).then(
+          function() {
+            console.log((issueId + ': Inserted and closed successfully. #' + issue.iid).green);
+          }, function(error) {
+            console.warn((issueId + ': Inserted successfully but failed to close. #' + issue.iid).yellow);
+          });
+    }
+
+    console.log((issueId + ': Inserted successfully. #' + issue.iid).green);
+  }, function(error) {
+    console.error((issueId + ': Failed to insert.').red, error);
+  });
+}
+
+/**
+ * Fetch all existing project issues from GitLab - assigns gitLab.gitlabIssues
+ */
+function getGitLabProjectIssues() {
+  return getRemainingGitLabProjectIssues(0, 100)
+      .then(function(result) {
+        log_progress("Fetched " + result.length + " GitLab issues.");
+        var issues = _.indexBy(result, 'iid');
+        return gitLab.gitlabIssues = issues;
+      });
+}
+
+/**
+ * Recursively fetch the remaining issues in the project
+ * @param page
+ * @param per_page
+ */
+function getRemainingGitLabProjectIssues(page, per_page) {
+  var from = page * per_page;
+  log_progress("Fetching Project Issues from GitLab [" + (from + 1) + "-" + (from + per_page) + "]...");
+  var url = gitlabAPIURLBase + '/projects/' + gitLab.project.id + "/issues";
+  var data = {
+    page: page,
+    per_page: per_page,
+    order_by: 'id',
+    private_token: gitlabAdminPrivateToken, sudo: gitlabSudo };
+
+  return rest.get(url, {data: data}).then(function(issues) {
+    if(issues.length < per_page) {
+      return issues;
+    }
+    return getRemainingGitLabProjectIssues(page+1, per_page)
+        .then(function(remainingIssues) {
+          return issues.concat(remainingIssues);
+        });
+  }, function(error) {
+    throw new Error('Cannot get list of issues from gitlab: ' + url + " page=" + page);
+  });
+}
+
+function getUserByMantisUsername(username) {
+  return (username && config.users[username]) || config.users[""] || null;
 }
 
 function getDescription(row) {
@@ -260,6 +372,10 @@ function getDescription(row) {
     description += "\n\n" + value;
   }
 
+  if (value = row.Notes) {
+    description += "\n\n" + value.split("$$$$").join("\n\n")
+  }
+
   return description;
 }
 
@@ -286,52 +402,55 @@ function isClosed(row) {
   return config.closed_statuses[row.Status];
 }
 
-function insertIssue(projectId, title, description, assigneeId, milestoneId, labels, creatorId, privateToken, callback) {
-  var url = gitlabAPIURLBase + '/projects/' + projectId + '/issues';
-  var data = {
-    title: title,
-    description: description,
-    assignee_id: assigneeId,
-    milestone_id: milestoneId,
-    labels: labels,
-    sudo: creatorId,
-    private_token: privateToken
-  };
-
-  rest.post(url, {data: data}).on('complete', function(result, response) {
-    if (util.isError(result)) {
-      callback(result);
-      return;
-    }
-
-    if (response.statusCode != 201) {
-      callback(result);
-      return;
-    }
-
-    callback(null, result);
-  });
+function getIssue(projectId, issueId) {
+  return Q(gitLab.gitlabIssues[issueId]);
+  //
+  //var url = gitlabAPIURLBase + '/projects/' + projectId + '/issues?iid=' + issueId;
+  //var data = { private_token: gitlabAdminPrivateToken, sudo: gitlabSudo };
+  //
+  //return rest.get(url, {data: data})
+  //    .then(function(issues) {
+  //      var issue = issues[0];
+  //      if(!issue) {
+  //        throw new Error("Issue not found: " + issueId);
+  //      }
+  //      return issue;
+  //    });
 }
 
-function closeIssue(issue, privateToken, callback) {
+function insertIssue(projectId, data) {
+  var url = gitlabAPIURLBase + '/projects/' + projectId + '/issues';
+
+  return rest.post(url, {data: data})
+      .then(null, function(error) {
+        throw new Error('Failed to insert issue into GitLab: ' + url);
+      });
+}
+
+function updateIssue(projectId, issueId, data) {
+  var url = gitlabAPIURLBase + '/projects/' + projectId + '/issues/' + issueId;
+
+  return rest.put(url, {data: data})
+      .then(null, function(error) {
+        throw new Error('Failed to update issue in GitLab: ' + url + " " + JSON.stringify(error));
+      });
+}
+
+function closeIssue(issue, custom) {
   var url = gitlabAPIURLBase + '/projects/' + issue.project_id + '/issues/' + issue.id;
-  var data = {
+  var data = _.extend({
     state_event: 'close',
-    private_token: privateToken,
+    private_token: gitlabAdminPrivateToken,
     sudo: gitlabSudo
-  };
+  }, custom);
 
-  rest.put(url, {data: data}).on('complete', function(result, response) {
-    if (util.isError(result)) {
-      callback(result);
-      return;
-    }
+  return rest.put(url, {data: data})
+      .then(null, function(error) {
+        throw new Error('Failed to close issue in GitLab: ' + url);
+      });
+}
 
-    if (response.statusCode != 200) {
-      callback(result);
-      return;
-    }
 
-    callback(null);
-  });
+function log_progress(message) {
+  console.log(message.grey);
 }
