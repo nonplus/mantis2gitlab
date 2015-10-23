@@ -1,6 +1,19 @@
 # Mantis2GitLab
 
-Import Mantis issues into GitLab.
+Script for importing Mantis issues into (a new project in) GitLab.  The created GitLab issues will have the same
+issue numbers are the corresponding Mantis issues.  Please do not use this script against a GitLab project that
+has GitLab issue.
+
+The script performs the following:
+
+ * Reads configuration file and Mantis SVN export
+ * Fetches GitLab Project and Members
+ * Fetches existing issues from GitLab Project
+ * For each Mantis Issue
+   * If a corresonding GitLab issue exists, its Title, Description, Labels and Closed status are updated
+   * Otherwise
+     * If there is a "gap" in Mantis issue numbers, "Skipped Mantis Issue" GitLab issue(s) are created
+     * A new GitLab issue is created with an appropriate Title, Description, Labels and Closed status
 
 ## Install
 
