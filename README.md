@@ -18,7 +18,7 @@ The script performs the following:
 ## Install
 
 ```
-npm install -g mantis2gitlab
+npm install -g nonplus/mantis2gitlab
 ```
 
 ## Usage
